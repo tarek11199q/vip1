@@ -1,0 +1,205 @@
+name: Hermes Agent — Telegram + NVIDIA (all tools)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: hermes-agent
+  cancel-in-progress: false
+
+env:
+  RUN_MINUTES: 330
+  HERMES_HOME: /home/runner/.hermes
+  DATA_REPO: tarek11199/agentstorage
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      # ── 1. Pull persisted data from private repo ──
+      - name: Pull data repo
+        env:
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          date +%s > /tmp/job_start
+          mkdir -p "$HERMES_HOME"
+          git clone --depth 1 "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" /tmp/data || true
+          if [ -d /tmp/data ]; then
+            rm -f /tmp/data/.env
+            rsync -a --exclude='.git' /tmp/data/ "$HERMES_HOME/" || true
+            find "$HERMES_HOME" -name "*.gh-chunk.000" | while read -r first; do
+              base="${first%.gh-chunk.000}"
+              cat "${base}".gh-chunk.* > "$base"
+              rm -f "${base}".gh-chunk.*
+              echo "Reassembled: $base"
+            done
+          fi
+
+      # ── 2. Install Hermes Agent ──
+      - name: Install Hermes Agent
+        run: |
+          rm -rf "$HERMES_HOME/hermes-agent"
+          curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # ── 3. Start SearXNG (free web search) ──
+      - name: Start SearXNG
+        run: |
+          mkdir -p /tmp/searxng
+          cat > /tmp/searxng/settings.yml <<'EOF'
+          use_default_settings: true
+          server:
+            secret_key: "hermes-searxng-secret"
+            limiter: false
+          search:
+            formats:
+              - html
+              - json
+          EOF
+          docker run -d --name searxng -p 8080:8080 \
+            -v /tmp/searxng:/etc/searxng \
+            searxng/searxng:latest
+          echo "Waiting for SearXNG..."
+          for i in $(seq 1 30); do
+            if curl -s "http://localhost:8080/search?q=test&format=json" | grep -q results; then
+              echo "SearXNG is ready"; exit 0
+            fi
+            sleep 2
+          done
+          echo "SearXNG failed to start"; exit 1
+
+      # ── 4. Start Camoufox (stealth browser) ──
+      - name: Start Camoufox
+        run: |
+          pip install -U "camoufox[geoip]"
+          python3 -m camoufox fetch
+          nohup python3 -c "
+          from camoufox.server import launch_server
+          launch_server(headless=True, port=9222, ws_path='hermes')
+          " > /tmp/camoufox.log 2>&1 &
+          sleep 20
+          echo "Camoufox launched"
+
+      # ── 5. Write .env (NVIDIA_API_KEY included — direct provider mode) ──
+      - name: Write .env
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          mkdir -p "$HERMES_HOME"
+          cat > "$HERMES_HOME/.env" <<EOF
+          TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+          TELEGRAM_ALLOWED_USERS=${TELEGRAM_USER_ID}
+          SEARXNG_URL=http://localhost:8080
+          CAMOUFOX_URL=ws://127.0.0.1:9222/hermes
+          NVIDIA_API_KEY=${NVIDIA_API_KEY}
+          GROQ_API_KEY=${GROQ_API_KEY}
+          EOF
+
+      # ── 6. Configure Hermes (direct NVIDIA endpoint — pick model with /model in Telegram) ──
+      - name: Configure Hermes
+        run: |
+          hermes config unset providers.nim.base_url || true
+          hermes config unset providers.nim.api_key_env || true
+          hermes config unset model.base_url || true
+          hermes config set model.provider "nvidia"
+          hermes config set providers.nvidia.base_url "https://integrate.api.nvidia.com/v1" || true
+          hermes config set providers.nvidia.api_key_env NVIDIA_API_KEY || true
+          hermes config set web.search_backend searxng
+          hermes config set tts.provider edge
+          hermes config set toolsets '["terminal","files","web","browser","code","vision","tts","memory","skills","delegation","cron"]'
+          hermes doctor || true
+          echo "── Final model config ──"
+          hermes config get model || true
+
+      # ── 7. Background backup loop (every 30 min -> backup branch) ──
+      - name: Start backup loop
+        env:
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          cat > /tmp/sync.sh <<'EOF'
+          #!/bin/bash
+          while true; do
+            sleep 1800
+            rm -rf /tmp/backup && mkdir -p /tmp/backup
+            rsync -a --exclude='.env' --exclude='.git' --exclude='*.log' --exclude='hermes-agent' "$HERMES_HOME/" /tmp/backup/
+            cd /tmp/backup
+            find . -type f -size +90M | while read -r f; do
+              split -b 90M -d -a 3 "$f" "$f.gh-chunk."
+              rm -f "$f"
+            done
+            git init -q -b backup
+            git config user.email "bot@hermes" && git config user.name "hermes-bot"
+            git add -A && git commit -q -m "backup $(date -u +%FT%TZ)" || true
+            git push -f "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" backup 2>/dev/null || true
+            echo "Backup pushed at $(date)"
+          done
+          EOF
+          chmod +x /tmp/sync.sh
+          HERMES_HOME="$HERMES_HOME" DATA_REPO="$DATA_REPO" DATA_REPO_TOKEN="$DATA_REPO_TOKEN" nohup /tmp/sync.sh > /tmp/sync.log 2>&1 &
+
+      # ── 8. Notify start on Telegram ──
+      - name: Notify start
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+        run: |
+          TG_API="https://api.telegram.org"
+          curl -s -X POST "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_USER_ID}" \
+            -d text="🟢 Hermes Agent ONLINE — use /model in Telegram to pick an NVIDIA model" > /dev/null
+
+      # ── 9. Run gateway with time budget ──
+      - name: Run Hermes gateway
+        run: |
+          JOB_START=$(cat /tmp/job_start)
+          END=$(( JOB_START + RUN_MINUTES * 60 ))
+          while true; do
+            NOW=$(date +%s)
+            REMAIN=$(( (END - NOW) / 60 ))
+            if [ "$REMAIN" -le 2 ]; then
+              echo "Time budget exhausted"; break
+            fi
+            echo "Starting gateway (${REMAIN}m remaining)..."
+            timeout -k 60 "${REMAIN}m" hermes gateway || true
+            echo "Gateway exited, restarting in 10s..."
+            sleep 10
+          done
+
+      # ── 10. Final push to data repo (main) ──
+      - name: Final data push
+        if: always()
+        env:
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          rm -rf /tmp/final && mkdir -p /tmp/final
+          rsync -a --exclude='.env' --exclude='.git' --exclude='*.log' --exclude='hermes-agent' "$HERMES_HOME/" /tmp/final/ || true
+          cd /tmp/final
+          find . -type f -size +90M | while read -r f; do
+            split -b 90M -d -a 3 "$f" "$f.gh-chunk."
+            rm -f "$f"
+          done
+          cat > .gitignore <<'EOF'
+          .env
+          *.log
+          EOF
+          git init -q -b main
+          git config user.email "bot@hermes" && git config user.name "hermes-bot"
+          git add -A && git commit -q -m "final save $(date -u +%FT%TZ)" || true
+          git push -f "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" main
+
+      # ── 11. Notify failure ──
+      - name: Notify failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+        run: |
+          TG_API="https://api.telegram.org"
+          curl -s -X POST "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_USER_ID}" \
+            -d text="🔴 Hermes Agent run FAILED — check Actions logs" > /dev/null
