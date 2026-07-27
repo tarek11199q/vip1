@@ -144,10 +144,35 @@ jobs:
               os.makedirs(HERMES_HOME, exist_ok=True)
               json.dump(pool, open(POOL, "w"), indent=1)
 
+          def probe(provider, mid):
+              # Fire a REAL 1-token completion. Catalog presence does NOT mean
+              # the model is callable on your plan (free tier can SEE premier/
+              # labs models in /models but gets 4xx when calling them).
+              # Returns False only on a definitive 4xx = "not usable on this
+              # plan/key". 429 (busy) and 5xx/network issues fail open.
+              base = BASE if provider == "nvidia" else "https://api.mistral.ai/v1"
+              keys = KEY_NAMES if provider == "nvidia" else MISTRAL_KEY_NAMES
+              if not keys:
+                  return False
+              body = json.dumps({"model": mid, "max_tokens": 1,
+                                 "messages": [{"role": "user", "content": "hi"}]}).encode()
+              req = urllib.request.Request(base + "/chat/completions", data=body,
+                  headers={"Authorization": "Bearer " + os.environ[keys[0]],
+                           "Content-Type": "application/json"})
+              try:
+                  with urllib.request.urlopen(req, timeout=45) as r:
+                      r.read()
+                  return True
+              except urllib.error.HTTPError as e:
+                  return e.code == 429 or e.code >= 500
+              except Exception:
+                  return True
+
           def prune_pool(pool):
-              # Providers retire models (HTTP 410 "end of life"). Anything no
-              # longer in the LIVE catalog is dropped so it can never poison
-              # pool-auto. Fail-open: if a catalog fetch fails, keep entries.
+              # Two-stage check so bad models can never poison pool-auto:
+              #  1. LIVE catalog — drops retired/EOL models (HTTP 410).
+              #  2. probe() — drops models your PLAN cannot actually call.
+              # Fail-open: if a catalog fetch fails, stage 1 keeps entries.
               live = {}
               try:
                   if KEY_NAMES:
@@ -161,11 +186,21 @@ jobs:
                   pass
               kept, removed = [], []
               for it in pool:
+                  # a provider with ZERO working keys has zero deployments:
+                  # its pool entries are useless, drop them
+                  keys_for = KEY_NAMES if it["provider"] == "nvidia" else MISTRAL_KEY_NAMES
+                  if not keys_for:
+                      removed.append(it["id"])
+                      continue
                   cat = live.get(it["provider"])
-                  if cat is None or it["id"] in cat:
+                  if cat is not None and it["id"] not in cat:
+                      removed.append(it["id"])
+                      continue
+                  if probe(it["provider"], it["id"]):
                       kept.append(it)
                   else:
                       removed.append(it["id"])
+                  time.sleep(1.1)  # respect the 1 req/sec free-tier limit
               return kept, removed
 
           def auto_prune_loop():
@@ -213,7 +248,18 @@ jobs:
                     "  allowed_fails: 1",
                     "  cooldown_time: 30",
                     "  enable_pre_call_checks: true",
-                    "  timeout: 90"]
+                    "  timeout: 90",
+                    # NVIDIA NIM sometimes returns HTTP 400 for INFRA problems
+                    # ("DEGRADED function cannot be invoked") which is really a
+                    # deployment-specific outage, not a bad request. Retry
+                    # BadRequestError too so rotation moves to a healthy
+                    # model/key instead of instantly failing the user's turn.
+                    "  retry_policy:",
+                    "    BadRequestErrorRetries: 4",
+                    "    TimeoutErrorRetries: 5",
+                    "    RateLimitErrorRetries: 5",
+                    "    InternalServerErrorRetries: 5",
+                    "    ContentPolicyViolationErrorRetries: 2"]
               # NO fallbacks: the router NEVER silently swaps to a different
               # model. Rate limits are handled by rotating API keys of the
               # SAME model: 1 fail -> that key cools 30s -> next key, 5 retries.
@@ -610,30 +656,49 @@ jobs:
             exit 1
           fi
 
-          # ── split bulk NVIDIA_KEYS (one per line; commas also OK) ──
+          # ── split + VALIDATE bulk NVIDIA_KEYS (one per line; commas also OK) ──
+          # every key is auth-checked against the live API; keys that return
+          # 401/403 (revoked/banned/typo) are DROPPED so they never poison the
+          # rotation pool. 429/timeouts do NOT drop a key (fail-open).
           : > /tmp/litellm.env
-          n=0
+          n=0; bad_n=0
           while IFS= read -r k; do
             k=$(echo "$k" | tr -d ' \r')
             [ -z "$k" ] && continue
-            n=$((n+1))
-            echo "NVIDIA_KEY_${n}=${k}" >> /tmp/litellm.env
+            code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' \
+              -H "Authorization: Bearer ${k}" https://integrate.api.nvidia.com/v1/models)
+            if [ "$code" = "401" ] || [ "$code" = "403" ]; then
+              bad_n=$((bad_n+1))
+              echo "::warning::Dropping NVIDIA key #$((n+bad_n)) — auth check failed (HTTP $code)"
+            else
+              n=$((n+1))
+              echo "NVIDIA_KEY_${n}=${k}" >> /tmp/litellm.env
+            fi
+            sleep 1
           done < <(printf '%s\n' "$NVIDIA_KEYS" | tr ',' '\n')
-          echo "Loaded $n NVIDIA key(s)"
+          echo "NVIDIA keys: $n valid, $bad_n dropped"
           if [ "$n" -eq 0 ]; then
-            echo "::error::NVIDIA_KEYS secret is empty — add at least one key"
+            echo "::error::No working NVIDIA key — secret is empty or every key failed the auth check"
             exit 1
           fi
 
-          # ── split bulk MISTRAL_KEYS (one per line; commas also OK; optional) ──
-          m=0
+          # ── split + VALIDATE bulk MISTRAL_KEYS (one per line; commas also OK; optional) ──
+          m=0; bad_m=0
           while IFS= read -r k; do
             k=$(echo "$k" | tr -d ' \r')
             [ -z "$k" ] && continue
-            m=$((m+1))
-            echo "MISTRAL_KEY_${m}=${k}" >> /tmp/litellm.env
+            code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' \
+              -H "Authorization: Bearer ${k}" https://api.mistral.ai/v1/models)
+            if [ "$code" = "401" ] || [ "$code" = "403" ]; then
+              bad_m=$((bad_m+1))
+              echo "::warning::Dropping Mistral key #$((m+bad_m)) — auth check failed (HTTP $code)"
+            else
+              m=$((m+1))
+              echo "MISTRAL_KEY_${m}=${k}" >> /tmp/litellm.env
+            fi
+            sleep 1
           done < <(printf '%s\n' "$MISTRAL_KEYS" | tr ',' '\n')
-          echo "Loaded $m Mistral key(s)"
+          echo "Mistral keys: $m valid, $bad_m dropped"
 
           # make the split keys visible to this shell + panel process
           set -a; source /tmp/litellm.env; set +a
