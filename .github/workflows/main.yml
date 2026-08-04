@@ -268,7 +268,10 @@ jobs:
             echo "Running services:"
             pgrep -a -f 'hermes|camoufox|litellm|searxng|cloudflared' | cut -c1-105
             echo
-            echo "Browser windows appear here when the agent works..."
+            echo "NOTE: the Camofox browser is NOT on this desktop!"
+            echo "Open the 'Camofox browser' link from the Telegram start"
+            echo "message to watch/control it (noVNC :6081, same password)."
+            echo "Here you only see: fallback Chrome + your own script windows."
             sleep 2
           done
           EOF
@@ -307,32 +310,170 @@ jobs:
           # CAMOFOX_URL is set: Camoufox = Firefox fork with C++-level
           # fingerprint spoofing, so sites cannot detect/track agentic work
           # (no CDP automation beacons like Chrome).
-          # HEADED + VISIBLE: camofox auto-runs NON-headless when a display
-          # exists, so with DISPLAY=:99 its window shows on the LIVE DESKTOP.
-          # Log into your accounts there over VNC - the agent works in that
-          # SAME browser and inherits your logged-in sessions.
-          # PERSISTENT LOGINS: cookies/localStorage saved to
-          # CAMOFOX_PROFILE_DIR under ~/.hermes/data so the backup loop
-          # carries your logins across runs.
+          # VISIBLE VIA ITS OWN VNC: the camofox server subprocess STRIPS
+          # DISPLAY (lib/config.js serverEnv), so the browser can never render
+          # on our :99 desktop - camoufox-js spawns its OWN private Xvfb.
+          # Official fix = bundled VNC plugin (ENABLE_VNC=1): it resizes that
+          # private Xvfb to 1920x1080, attaches x11vnc on :5901 and serves
+          # noVNC on :6081 (our own desktop owns :5900/:6080). Log into your
+          # accounts THERE - the agent works in that SAME browser and
+          # inherits your logged-in sessions.
+          # LAZY LAUNCH (tamed by fix44/46): engine warm-starts at boot, a
+          # placeholder tab keeps a window rendered, and idle/session/tab
+          # timeouts are raised to 24h so nothing dies between uses.
+          # PERSISTENT LOGINS (fix47): the server NEVER writes cookies to
+          # disk by itself (contexts are in-memory), so the keepalive
+          # exports boss-view cookies every 2 min (GET /sessions/boss-view/
+          # storage_state) into ~/.hermes/data/camofox-profiles - pushed to
+          # the data repo by the backup loop - and re-imports them (POST
+          # /sessions/boss-view/cookies) after every engine start/restart,
+          # so logins survive runs AND mid-run restarts.
           # Fail-soft: without it, Configure falls back to visible Chrome.
           git clone --depth 1 https://github.com/jo-inc/camofox-browser /tmp/camofox-browser 2>/dev/null || true
           if [ -d /tmp/camofox-browser ]; then
             mkdir -p "$HERMES_HOME/data/camofox-profiles"
             ( cd /tmp/camofox-browser && timeout 600 npm install > /tmp/camofox-npm.log 2>&1 ) \
               || echo "::warning::camofox-browser npm install failed - see /tmp/camofox-npm.log"
-            ( cd /tmp/camofox-browser && DISPLAY=:99 CAMOFOX_PORT=9377 \
+            ( cd /tmp/camofox-browser && CAMOFOX_PORT=9377 \
                 CAMOFOX_BIND_HOST=127.0.0.1 \
                 CAMOFOX_PROFILE_DIR="$HERMES_HOME/data/camofox-profiles" \
+                ENABLE_VNC=1 VNC_RESOLUTION=1920x1080 \
+                VNC_PASSWORD="${PANEL_TOKEN:-hermes99}" \
+                VNC_PORT=5901 NOVNC_PORT=6081 \
+                SESSION_TIMEOUT_MS=86400000 TAB_INACTIVITY_MS=86400000 \
+                BROWSER_IDLE_TIMEOUT_MS=86400000 \
+                NATIVE_MEM_RESTART_THRESHOLD_MB=2048 \
+                BROWSER_RSS_RESTART_THRESHOLD_MB=4096 \
                 nohup npm start > /tmp/camofox-srv.log 2>&1 & )
             for i in $(seq 1 40); do
               if curl -sf http://127.0.0.1:9377/health > /dev/null 2>&1 \
                  || curl -sf http://127.0.0.1:9377/tabs > /dev/null 2>&1; then
                 echo "http://127.0.0.1:9377" > /tmp/camofox_url
-                echo "Camofox ready on :9377 - HEADED on :99 (log in via live desktop)"
+                echo "Camofox ready on :9377 - browser visible on its OWN noVNC :6081 (warm-started at boot)"
                 break
               fi
               sleep 3
             done
+          fi
+          # fix43: WARM START the browser engine NOW + keep it alive, so the
+          # noVNC view on :6081 is actually connectable from minute 1.
+          # fix46: loadConfig() reads process.env DIRECTLY when npm start
+          # runs the server (the serverEnv allowlist only filters env when
+          # the OpenClaw plugin spawns it), so the launch line raises
+          # session/tab/idle timeouts to 24h and the auto-restart
+          # thresholds (native-mem 300MB -> 2GB, browser RSS 1.5GB -> 4GB)
+          # that were closing ALL windows mid-login (the Facebook vanish).
+          # The keepalive (python) still revives the engine if down AND
+          # keeps ONE placeholder tab (userId boss-view) refreshed every 2
+          # min, so the tab-inactivity (5 min) and engine-idle (5 min)
+          # timers never fire: a window is ALWAYS rendered (no black screen,
+          # the display has no window manager so no-window = black) and the
+          # engine never dies (no VNC disconnect cycle).
+          # fix47: it also exports boss-view cookies to the data-repo dir
+          # every cycle and re-imports them into fresh sessions, so logins
+          # survive engine restarts AND whole machine runs.
+          if [ -f /tmp/camofox_url ]; then
+            curl -s --max-time 30 -X POST http://127.0.0.1:9377/start \
+              -H 'Content-Type: application/json' -d '{}' \
+              > /tmp/camofox-warmstart.log 2>&1 || true
+            cat > /tmp/camofox-keepalive.py <<'PYKA'
+          #!/usr/bin/env python3
+          # Keep the Camofox engine AND one placeholder tab alive so the
+          # noVNC view always shows a browser window (no black screen) and
+          # x11vnc never dies from the 5-min idle shutdown (no disconnects).
+          import json, os, time, urllib.request
+
+          BASE = "http://127.0.0.1:9377"
+          STATE = (os.environ.get("CAMOFOX_STATE_FILE") or
+                   "/home/runner/.hermes/data/camofox-profiles/boss-view-storage.json")
+          IDLE_PAGE = ("data:text/html,<body style='background:%23111;color:%23ddd;"
+                       "font-family:sans-serif;display:flex;align-items:center;"
+                       "justify-content:center;height:100vh;text-align:center'>"
+                       "<div><h1>&%23128058; Camofox is awake</h1>"
+                       "<p>This placeholder tab keeps the browser alive.<br>"
+                       "The agent browses in tabs of this SAME window, with your logins.<br>"
+                       "To log in yourself: use the agent's window, or open a new tab"
+                       " with the %2B button - do NOT use this tab.</p></div></body>")
+
+          def req(method, path, body=None, timeout=20):
+              data = json.dumps(body).encode() if body is not None else None
+              r = urllib.request.Request(BASE + path, data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+              with urllib.request.urlopen(r, timeout=timeout) as f:
+                  raw = f.read().decode() or "{}"
+              try:
+                  return json.loads(raw)
+              except Exception:
+                  return {}
+
+          def restore_cookies():
+              # Fresh engine/session starts with ZERO cookies - re-import the
+              # saved logins so the user never has to log in again.
+              try:
+                  with open(STATE) as f:
+                      cookies = (json.load(f) or {}).get("cookies") or []
+              except Exception:
+                  return
+              for i in range(0, len(cookies), 400):
+                  try:
+                      req("POST", "/sessions/boss-view/cookies",
+                          {"cookies": cookies[i:i + 400]}, timeout=30)
+                  except Exception:
+                      pass
+
+          def save_cookies():
+              # Export boss-view cookies+localStorage into the data-repo dir;
+              # the backup loop pushes it, so logins survive machine runs.
+              try:
+                  st = req("GET", "/sessions/boss-view/storage_state", timeout=30)
+              except Exception:
+                  return
+              if not isinstance(st, dict) or not st.get("cookies"):
+                  return
+              try:
+                  os.makedirs(os.path.dirname(STATE), exist_ok=True)
+                  tmp = STATE + ".tmp"
+                  with open(tmp, "w") as f:
+                      json.dump(st, f)
+                  os.replace(tmp, STATE)
+              except Exception:
+                  pass
+
+          tab = None
+          while True:
+              try:
+                  st = req("GET", "/vnc/status", timeout=8)
+                  if not st.get("running"):
+                      try:
+                          req("POST", "/start", {}, timeout=40)
+                      except Exception:
+                          pass
+                      time.sleep(15)
+                  if tab:
+                      try:
+                          req("POST", "/tabs/" + str(tab) + "/refresh", {}, timeout=30)
+                      except Exception:
+                          tab = None
+                  if not tab:
+                      for target in (IDLE_PAGE, "about:blank"):
+                          try:
+                              resp = req("POST", "/tabs", {"userId": "boss-view",
+                                         "sessionKey": "view", "url": target}, timeout=60)
+                              tab = (resp.get("id") or resp.get("tabId") or
+                                     (resp.get("tab") or {}).get("id"))
+                              if tab:
+                                  break
+                          except Exception:
+                              continue
+                      if tab:
+                          restore_cookies()
+                  save_cookies()
+              except Exception:
+                  pass
+              time.sleep(120)
+          PYKA
+            CAMOFOX_STATE_FILE="$HERMES_HOME/data/camofox-profiles/boss-view-storage.json" nohup python3 /tmp/camofox-keepalive.py > /tmp/camofox-keepalive.log 2>&1 &
+            echo "Camofox warm start sent; keepalive keeps engine + placeholder tab alive (no more idle shutdown)"
           fi
           [ -f /tmp/camofox_url ] || echo "::warning::Camofox not reachable - built-in tools fall back to visible Chrome"
           # FALLBACK ONLY: launch a visible Chrome (with CDP) if and only if
@@ -1113,7 +1254,19 @@ jobs:
           # through the anti-detect server (flag written in step 4 on success)
           if [ -f /tmp/camofox_url ]; then
             echo "CAMOFOX_URL=$(cat /tmp/camofox_url)" >> "$HERMES_HOME/.env"
-            echo "CAMOFOX_URL set - built-in browsing is anti-detect"
+            # fix48: pin built-in browser tools to the SAME Camofox identity
+            # the user watches + logs into (the keepalive placeholder
+            # session "boss-view"). Hermes docs "Externally managed Camofox
+            # sessions": setting user_id makes Hermes share that window,
+            # profile and cookie jar, skip destructive cleanup and never
+            # DELETE the session. Without it Hermes invents a RANDOM
+            # ephemeral userId per task = fresh logged-out WINDOW each time
+            # (the "multiple windows" + "ignores my logins" complaints).
+            # session_key stays UNSET on purpose: Hermes opens its OWN tab
+            # per task instead of adopting the placeholder tab, so the
+            # keepalive's 2-min refresh never reloads the agent's page.
+            echo "CAMOFOX_USER_ID=boss-view" >> "$HERMES_HOME/.env"
+            echo "CAMOFOX_URL set - built-in browsing is anti-detect (shared boss-view session)"
           fi
 
       # ── 8. Standing instructions for the agent (auto save-to-file) ──
@@ -1175,17 +1328,36 @@ jobs:
           - BROWSER: your built-in browser_* tools run through Camofox - an
             anti-detect Camoufox browser (Firefox with C++-level fingerprint
             spoofing), so sites cannot detect or track your automation. It
-            runs HEADED on the shared display :99: the user SEES your
-            browsing live over VNC and can take the mouse to log into
-            accounts, solve captchas or step in - then you continue in that
-            SAME browser with their logged-in session. Logins persist in
-            ~/.hermes/data/camofox-profiles and survive across runs. If a
-            page needs the user's login or a captcha, ASK the user to do it
-            in the live desktop, wait for their confirmation, then continue.
-            When you write your OWN browser scripts, connect
+            renders on its OWN virtual display, NOT the main :99 desktop:
+            the user watches and controls it via the dedicated "Camofox
+            browser" noVNC link from the start message. A keepalive keeps
+            the engine awake with a placeholder tab under userId
+            "boss-view" - NEVER close that tab or its session. Your browser
+            tools are PINNED to that SAME identity (CAMOFOX_USER_ID
+            boss-view): every tab you open lives in the user's ONE Camofox
+            window, sharing ONE profile and ONE cookie jar with their tabs,
+            so their logins (Facebook etc.) are ALREADY yours. USE YOUR
+            BUILT-IN browser_* TOOLS BY DEFAULT for EVERY website task -
+            visiting, logging in, posting, scraping, forms - never ask the
+            user which browser to use and never open a separate browser for
+            a job the built-in tools can do. When a task is done, CLOSE the
+            tabs you opened - but NEVER the placeholder tab or tabs the
+            user is using. The user can take the
+            mouse there to
+            log into accounts, solve captchas or step in - then you continue
+            in that SAME browser with their logged-in session. Logins persist
+            in ~/.hermes/data/camofox-profiles and survive across runs. If a
+            page needs the user's login or a captcha, OPEN a tab on that page
+            and KEEP it open (the window closes when no tabs are open), ASK
+            the user to log in via the Camofox browser link, wait for their
+            confirmation, then continue.
+            Writing your OWN browser scripts is a LAST RESORT for jobs the
+            built-in tools truly cannot do - that is a DIFFERENT browser
+            with NONE of the user's logins. If you must: connect
             playwright/camoufox to ws://127.0.0.1:9222/hermes or ALWAYS pass
             headless=False - NEVER headless=True or headless='virtual' - so
-            windows show on the shared display. The visible Chrome
+            windows show on the shared display :99 (the main live desktop -
+            unlike the built-in Camofox tools). The visible Chrome
             (CDP http://127.0.0.1:9223) is a last resort for CDP-only work;
             assume sites can detect it.
           - TYPING INTO WEB APPS (Facebook, Messenger, WhatsApp Web,
@@ -1295,13 +1467,24 @@ jobs:
           # came up (CAMOFOX_URL in .env routes ALL browser_* tools through
           # it). Otherwise fall back to the visible Chrome over CDP.
           if [ -f /tmp/camofox_url ]; then
-            echo "Built-in browser tools: Camofox anti-detect (no CDP beacons)"
+            # fix48: same shared identity in config.yaml too (the .env var
+            # takes precedence; this covers direct hermes runs/doctor)
+            hermes config set browser.camofox.user_id boss-view
+            echo "Built-in browser tools: Camofox anti-detect (no CDP beacons) - shared boss-view session"
           else
             hermes config set browser.cdp_url "http://127.0.0.1:9223"
             echo "Built-in browser tools: visible Chrome fallback (CDP :9223)"
           fi
-          # edge-tts CLI is needed by the tts toolset (free Microsoft voices)
-          pip install -q edge-tts || true
+          # edge-tts CLI is needed by the tts toolset (free Microsoft voices).
+          # ALWAYS upgrade to the latest release: Microsoft periodically breaks
+          # old edge-tts versions (auth/DRM token changes), which surfaces as
+          # "NoAudioReceived" from the built-in text_to_speech tool. The hermes
+          # venv is restored from CACHE with its own stale edge_tts copy that
+          # the built-in tool imports, so upgrade BOTH copies every run.
+          pip install -q -U edge-tts || true
+          "$HERMES_HOME/hermes-agent/venv/bin/pip" install -q -U edge-tts \
+            && echo "edge-tts upgraded inside hermes venv: $("$HERMES_HOME/hermes-agent/venv/bin/pip" show edge-tts 2>/dev/null | awk '/^Version/{print $2}')" \
+            || echo "::warning::could not upgrade edge-tts inside hermes venv - built-in TTS may fail with NoAudioReceived"
           hermes config set tts.provider edge
 
           hermes config set toolsets '["terminal","files","web","browser","code","vision","tts","memory","skills","delegation","cron"]'
@@ -3015,7 +3198,8 @@ jobs:
           app.run(host="127.0.0.1", port=7777, threaded=True)
           PYJARVIS
           sudo apt-get install -y -q ffmpeg >/dev/null 2>&1 || true
-          pip install -q flask requests edge-tts || true
+          pip install -q flask requests || true
+          pip install -q -U edge-tts || true
           # onnxruntime/soundfile are what Supertonic needs to run on CPU
           pip install -q supertonic onnxruntime soundfile numpy > /tmp/supertonic_pip.log 2>&1 || echo '::warning::supertonic install failed - Edge TTS still works'
           nohup python3 /tmp/jarvis/app.py > /tmp/jarvis.log 2>&1 &
@@ -3169,6 +3353,20 @@ jobs:
           done
           [ -n "$LIVEVIEW_URL" ] && LIVEVIEW_URL="${LIVEVIEW_URL}/vnc.html?autoconnect=1&resize=scale&reconnect=1"
           echo "::notice title=🔭 Live desktop view::${LIVEVIEW_URL:-tunnel failed}"
+          # fourth quick tunnel: CAMOFOX BROWSER VIEW. The browser renders on
+          # its OWN private Xvfb (never :99), exposed by the camofox VNC
+          # plugin as noVNC on :6081 - see the Start Camoufox step.
+          BROWSERVIEW_URL=""
+          if [ -f /tmp/camofox_url ]; then
+            nohup cloudflared tunnel --no-autoupdate --url http://localhost:6081 > /tmp/browserview-tunnel.log 2>&1 &
+            for i in $(seq 1 30); do
+              BROWSERVIEW_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/browserview-tunnel.log | head -n1 || true)
+              [ -n "$BROWSERVIEW_URL" ] && break
+              sleep 2
+            done
+            [ -n "$BROWSERVIEW_URL" ] && BROWSERVIEW_URL="${BROWSERVIEW_URL}/vnc.html?autoconnect=1&resize=scale&reconnect=1"
+          fi
+          echo "::notice title=🦊 Camofox browser view::${BROWSERVIEW_URL:-not available}"
           TG_API="https://api.telegram.org"
           TG_RESP=$(curl -s -X POST "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_USER_ID}" \
@@ -3177,7 +3375,8 @@ jobs:
           🖥️ Hermes WebUI: ${WEBUI_URL:-not available}
           📊 Dashboard: ${DASHBOARD_URL:-not available} (user: boss)
           ⏱ Run length: ${RUN_HOURS_INPUT:-5.5} hours
-          🔭 Live desktop: ${LIVEVIEW_URL:-not available} (FULL control - pass: first 8 chars of PANEL_TOKEN - log into your accounts in the Camofox window, logins are saved)
+          🔭 Live desktop: ${LIVEVIEW_URL:-not available} (agent GUI + fallback Chrome - FULL control - pass: first 8 chars of PANEL_TOKEN)
+          🦊 Camofox browser: ${BROWSERVIEW_URL:-not available} (the agent's ACTUAL browser - log into your accounts HERE, logins are saved - the agent works in THIS same window and sees your logins (placeholder tab keeps it awake) - brief black screen/disconnect = engine restarting, self-heals in ~1 min - same pass)
           🔑 Password: your PANEL_TOKEN secret
           Use /model in Telegram or !model in Slack to switch models")
           case "$TG_RESP" in
@@ -3185,7 +3384,7 @@ jobs:
             *) echo "::warning::Telegram start notification FAILED - grab the links from the line below. Response: $(echo "$TG_RESP" | head -c 200)" ;;
           esac
           # belt-and-braces: links always land in this step log too
-          echo "LINKS: model=${PANEL_URL:-n/a} | webui=${WEBUI_URL:-n/a} | dashboard=${DASHBOARD_URL:-n/a} | live=${LIVEVIEW_URL:-n/a}"
+          echo "LINKS: model=${PANEL_URL:-n/a} | webui=${WEBUI_URL:-n/a} | dashboard=${DASHBOARD_URL:-n/a} | live=${LIVEVIEW_URL:-n/a} | browser=${BROWSERVIEW_URL:-n/a}"
 
       # ── 13. Run gateway with time budget + anti-stuck watchdog ──
       - name: Run Hermes gateway
